@@ -1,5 +1,5 @@
-#-*- coding:utf-8 -*-
-#拉勾爬虫
+# -*- coding:utf-8 -*-
+# 爬虫组件类
 import time
 import logging
 import re
@@ -10,11 +10,13 @@ import random
 import itertools
 import os
 import csv
+import hashlib
+import shelve
 
 import requests
 from requests.exceptions import RequestException
 
-user_agent=[
+UserAgents=[
     'Mozilla/5.0 (Windows; U; Windows NT 6.1; en-US; rv:1.9.1.6) Gecko/20091201 Firefox/3.5.6',
     'Mozilla/5.0 (Windows NT 6.2) AppleWebKit/535.11 (KHTML, like Gecko) Chrome/17.0.963.12 Safari/535.11',
     'Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.2; Trident/6.0)',
@@ -36,38 +38,24 @@ logging.basicConfig(
                 filename='log',
                 level=logging.INFO
                             )
-search_root_url = 'https://www.lagou.com/jobs/positionAjax.json'
-IPProxyTool_url = 'http://127.0.0.1:8000/select?name=httpbin&https=yes'
 
-head_file_path = 'head.txt'
-search_file_path = 'search_res.csv'
-
-def _get_headers(head_file_path):
-    headers = {}
-    with open(head_file_path) as f:
-        for line in f:
-            l = [x.strip() for x in line.split(':',1)]
-            headers[l[0]] = l[1]
-    return headers
-
-def _get_data(isfrist,pagenum,keyword):
-    data = {
-        'first':isfrist,
-        'pn':pagenum,
-        'kd':keyword
-        }
-    return data
-
-class IPProxyTool:
+class ProxyTool():
+    """调用代理地址池"""
     def __init__(self,source,delay=300):
+        """source为本地代理池服务器的API"""
         self.source = source
-        self.proxies_pool = requests.get(source).json()
+        try:
+            self.proxies_pool = requests.get(source,timeout=3).json()
+        except:
+            logging.info('本地代理池服务器的API失败...')
         self.used_proxies = {}
         self.delay = delay
         logging.info('IP Prxoies Pool 初始化完成...包含{}个备用代理'.format(len(self.proxies_pool)))
-    def sort_proxies(self):        
+    def sort_proxies(self):
+        """按速度排序"""
         self.proxies_pool = sorted(self.proxies_pool,key=lambda x:x.get('speed'))
     def new_proxy(self):
+        """选取新的代理地址，设置同一个代理地址被使用的最小间隔时间，代理池用尽自动从服务器更新"""
         if self.proxies_pool:
             proxy = self.proxies_pool.pop(0)
             last_accessed = self.used_proxies.get(proxy.get('ip'))
@@ -76,141 +64,25 @@ class IPProxyTool:
                 if sleep_secs > 0:
                     time.sleep(sleep_secs)
             self.used_proxies[proxy.get('ip')] = datetime.now()
-            proxy_url = 'http://' + proxy.get('ip') + ':' + str(proxy.get('port'))
+            proxy_url = 'http://{}:{}'.format(proxy.get('ip'),str(proxy.get('port')))
             return {'http':proxy_url,'https':proxy_url}
         else :
             self.update_proxies()
             self.new_proxy()    
     def update_proxies(self):
+        """更新代理池"""
         self.proxies_pool = requests.get(self.source).json()
         self.sort_proxies()
         self.used_proxies = {}
         logging.info('IP Prxoies Pool更新完成...包含{}个备用代理'.format(len(self.proxies_pool)))
 
-def download_GET(
-    url,session,params=None,data=None,headers=None,
-    num_retry=2,proxies=None
-            ):
-    logging.info('GET:{}'.format(url))
-    try:    
-        res = session.get(url,params=params,data=data,headers=headers,proxies=proxies,timeout=2)
-        res.raise_for_status()
-    except RequestException as e:
-        logging.info('Request异常:{}'.format(e))
-        res = None
-        if num_retry > 0:
-            return download_GET(url,session,params,data,headers,
-                            num_retry=num_retry-1,proxies=None)
-    return res
-
-def download_POST(
-    url,session,params=None,data=None,headers=None,
-    num_retry=2,proxies=None
-            ):
-    #logging.info('POST:{}'.format(url))
-    #logging.info('session type:{}'.format(type(session)))
-    #logging.info('params:{}'.format(params))
-    #logging.info('data:{}'.format(data))
-    #logging.info('headers{}'.format(headers))
-    try:    
-        res = session.post(url,params=params,data=data,headers=headers,proxies=proxies,timeout=3)
-        res.raise_for_status()
-    except RequestException as e:
-        logging.info('Request异常:{}'.format(e))
-        res = None
-        if num_retry > 0:
-            return download_POST(url,session,params,data,headers,
-                            num_retry=num_retry-1,proxies=None)
-    return res
-
-def check_search_page(search_res_json):
-    if (search_res_json.get('content') and 
-        search_res_json['content']['positionResult']['result']):
-        return True
-    
-def lagou_search(keyword,job_ids_done,startpagenum=1,city='全国'):
-    _params = {
-        'px':'default',
-        'city':city,
-        'needAddtionalResult':'false',
-        'isSchoolJob':'0'
-            }
-    _headers = _get_headers(head_file_path)
-    _headers['User-Agent'] = random.choice(user_agent)
-    proxies_pool = IPProxyTool(IPProxyTool_url)
-    proxy = None
-    throttle = Throttle()
-    for pagenum in itertools.count(startpagenum,1):
-        num_retry = 10
-        if pagenum == 1:
-            _data = _get_data('true',str(pagenum),keyword)
-            logging.info('已开始爬取第1页搜索结果')
-            print('已开始爬取第1页搜索结果')
-        else:
-            _data = _get_data('false',str(pagenum),keyword)  
-        while num_retry > 0:
-            _session = requests.session()
-            throttle.wait(search_root_url)
-            search_res_json = download_POST(
-                    url=search_root_url,
-                    session=_session,
-                    params=_params,
-                    data=_data,
-                    headers=_headers,
-                    proxies = proxy
-                                ).json()
-            if check_search_page(search_res_json):
-                break
-            else:
-                logging.info('尝试爬取{}页失败,还将尝试{}次'.format(pagenum,num_retry))
-                _session.close()
-                num_retry -= 1
-                if num_retry < 8:
-                    proxy = proxies_pool.new_proxy()
-                    logging.info('变更代理地址:{}'.format(proxy))
-        if not check_search_page(search_res_json):
-            logging.info('爬取结束，共爬取{}条招聘信息'.format(len(job_ids_done)))
-            _session.close()
-            return len(job_ids_done)
-        else:
-            logging.info('已爬取第{}页搜索结果'.format(pagenum))                                            
-            for job_info in search_res_json['content']['positionResult']['result']:
-                if job_info['positionId'] not in job_ids_done:
-                    job_ids_done.append(job_info['positionId'])
-                    search_res_save(search_file_path,job_info)
-        
-def search_res_save(search_file_path,job_info):
-    tiltes = [
-        'city','companyFullName','companyId',
-        'createTime','education','positionId',
-        'positionName','salary','workYear'
-            ]
-    if (not os.path.exists(search_file_path) or not os.path.isfile(search_file_path)):
-        with open(search_file_path,'w') as f:
-            w = csv.writer(f)
-            w.writerow(tiltes)
-    else:
-        with open(search_file_path,'a') as f:
-            w = csv.writer(f)
-            row = [job_info.get(field) for field in tiltes]
-            w.writerow(row)
-
-def lagou_job_detail(job_id):
-    pass
-"""
-def lagouspider():
-    lagou_search(keyword)
-    lagou_job_detail(job_id)
-"""
-
-class Throttle:
-    """设置访问同一域名的最小间隔
-    """
+class Throttle():
+    """下载延迟，设置访问同一域名的最小间隔"""
     def __init__(self,delay_tag=-1):
+        """delay_tag为-1表示默认不设置延迟"""
         self.delay_tag = delay_tag
-        self.domains = {}
-        
-    def wait(self, url,delay_down=3,delay_up=5):
+        self.domains = {}       
+    def wait(self, url,delay_down=1,delay_up=3):
         delay = random.uniform(delay_down,delay_up)
         domain = urlparse(url).netloc
         last_accessed = self.domains.get(domain)
@@ -220,9 +92,149 @@ class Throttle:
                 time.sleep(sleep_secs)
         self.domains[domain] = datetime.now()
 
+class Cache():
+    """缓存"""
+    def __init__(self,cachedir='cache'):
+        cachedir = os.path.join(os.getcwd(),cachedir)
+        if not os.path.exists(cachedir):
+            try:
+                os.makedirs(cachedir)
+                logging.info("创建缓存文件夹成功...{}".format(cachedir))
+            except Exception as e:
+                logging.info("创建缓存文件夹失败...{}".format(e))
+        self.cache_file_path = os.path.join(cachedir,'cache.db')
+        
+
+    def label(self,url,headers,params,data):
+        """创建hash标签"""
+        headers.pop('User-Agent')
+        h = hashlib.blake2b(digest_size=25)
+        for x in (url,headers,params,data):
+            h.update(str(x).encode('utf-8'))
+        return h.hexdigest()
+    
+    @staticmethod
+    def compare_label(label1,label2):
+        return label1 == label2
+    
+class DiskCache(Cache):
+    def __getitem__(self,label):
+        """从磁盘加载缓存"""
+        with shelve.open(self.cache_file_path) as cache_db:
+            try:
+                return cache_db[label]
+            except:
+                raise KeyError(label,'缓存不存在...')
+
+    def __setitem__(self,label,result):
+        """将缓存存入磁盘"""
+        with shelve.open(self.cache_file_path) as cache_db:
+            cache_db[label] = result
+    
+class mongodbcache(Cache):
+    pass
+
+class Downloader():
+    def __init__(self,url,headers=None,params=None,
+                data=None,proxies=None,timeout=3,delay_tag=-1,retry=3,cache=None):
+        self.url = url
+        self.headers = headers
+        self.params = params
+        self.data = data
+        self.proxies = proxies
+        self.timeout = timeout
+        self.throttle = Throttle(delay_tag)
+        self.retry = retry
+        self.cache = cache
+        self.method = 'GET'
+        self.session = None
+        if headers is not None or UserAgents:
+            self.get_headers(headers,UserAgents)
+    def use_session(self):
+        self.session = requests.session()
+    def get_headers(self,path_to_headers_file=None,UserAgents=None):
+        self.headers = {}
+        if path_to_headers_file:          
+            with open(path_to_headers_file) as f:
+                for line in f:
+                    l = [x.strip() for x in line.split(':',1)]
+                    self.headers[l[0]] = l[1]
+        if UserAgents:
+            self.headers['User-Agent'] = random.choice(UserAgents)
+        
+    def __call__(self):
+        result = None
+        if self.cache:
+            self.label = self.cache.label(
+                            self.url,
+                            self.headers.copy(),
+                            self.params,
+                            self.data)
+            try:
+                result = self.cache[self.label]
+                logging.info('读取缓存成功...')
+            except KeyError:
+                logging.info('读取缓存失败...')
+            else:
+                if self.retry > 0 and result:
+                    result = None
+        if result is None:
+            self.throttle.wait(self.url)
+            if self.proxies:
+                self.proxies = self.proxies.new_proxy()
+            result = self.download()
+            if self.cache:
+                self.cache[self.label] = result
+        return result
+
+    def download(self):
+        loader = self.session if self.session else requests
+        if self.method == 'GET':
+            request_way = loader.get
+        elif self.method == 'POST':
+            request_way =  loader.post
+        try:
+            result = request_way(
+                        url=self.url,
+                        headers=self.headers,
+                        params=self.params,
+                        data=self.data,
+                        proxies=self.proxies,
+                        timeout=self.timeout
+                            )
+            result.raise_for_status()
+            return result
+        except RequestException as e:
+            logging.info('Request异常:{}'.format(e))
+            result = None
+            if self.retry > 0:
+                self.retry -= 1
+                return self.download()
 
 if __name__ == '__main__':
-    start_time = datetime.now()
-    job_ids_done = []
-    job_done_num = lagou_search('python',job_ids_done)
-    logging.info('完成爬取用时{}'.format((datetime.now()-start_time)))
+    search_root_url = 'https://www.lagou.com/jobs/positionAjax.json'
+    IPProxyTool_url = 'http://127.0.0.1:8000/select?name=httpbin&https=yes'
+    path_to_headers_file = 'head.txt'
+    params = {
+        'px':'default',
+        'city':'全国',
+        'needAddtionalResult':'false',
+        'isSchoolJob':'0'
+            }
+    data = {
+        'first':'true',
+        'pn':'1',
+        'kd':'python'
+        }
+    #proxies = ProxyTool(IPProxyTool_url)
+    cache = DiskCache()
+    d = Downloader(search_root_url,headers=path_to_headers_file,params=params,
+                data=data,proxies=None,timeout=3,delay_tag=-1,retry=3,cache=cache)
+    d.use_session()
+    d.method = 'POST'
+    result = d()
+    print(result.status_code)
+    #print(result.json().keys())
+    print(len(result.json().get('content')['positionResult']['result']))
+
+
