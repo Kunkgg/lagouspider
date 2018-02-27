@@ -6,6 +6,7 @@ import re
 from urllib.parse import urlparse
 import time
 from datetime import datetime
+from datetime import timedelta
 import random
 import itertools
 import os
@@ -17,6 +18,7 @@ import requests
 from requests.exceptions import RequestException
 
 UserAgents=[
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/64.0.3282.167 Chrome/64.0.3282.167 Safari/537.36',
     'Mozilla/5.0 (Windows; U; Windows NT 6.1; en-US; rv:1.9.1.6) Gecko/20091201 Firefox/3.5.6',
     'Mozilla/5.0 (Windows NT 6.2) AppleWebKit/535.11 (KHTML, like Gecko) Chrome/17.0.963.12 Safari/535.11',
     'Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.2; Trident/6.0)',
@@ -67,9 +69,9 @@ class ProxyTool():
             proxy_url = 'http://{}:{}'.format(proxy.get('ip'),str(proxy.get('port')))
             return {'http':proxy_url,'https':proxy_url}
         else :
-            self.update_proxies()
+            self.update_pool()
             self.new_proxy()    
-    def update_proxies(self):
+    def update_pool(self):
         """更新代理池"""
         self.proxies_pool = requests.get(self.source).json()
         self.sort_proxies()
@@ -104,7 +106,6 @@ class Cache():
                 logging.info("创建缓存文件夹失败...{}".format(e))
         self.cache_file_path = os.path.join(cachedir,'cache.db')
         
-
     def label(self,url,headers,params,data):
         """创建hash标签"""
         headers.pop('User-Agent')
@@ -112,26 +113,40 @@ class Cache():
         for x in (url,headers,params,data):
             h.update(str(x).encode('utf-8'))
         return h.hexdigest()
-    
-    @staticmethod
-    def compare_label(label1,label2):
-        return label1 == label2
-    
+       
 class DiskCache(Cache):
+    """磁盘缓存"""
+    def __init__(self,cachedir='cache',expires=timedelta(days=2)):
+        Cache.__init__(self,cachedir='cache')
+        self.expires = expires
+
     def __getitem__(self,label):
         """从磁盘加载缓存"""
         with shelve.open(self.cache_file_path) as cache_db:
             try:
-                return cache_db[label]
+                if self.not_expired(cache_db[label]['timestamp']):
+                    return cache_db[label]['response']
+                else:
+                    logging.info('缓存已过期...')
             except:
                 raise KeyError(label,'缓存不存在...')
-
-    def __setitem__(self,label,result):
+            
+    def __setitem__(self,label,response):
         """将缓存存入磁盘"""
+        timestamp = datetime.now()
         with shelve.open(self.cache_file_path) as cache_db:
-            cache_db[label] = result
+            cache_db[label] = {
+                            'response':response,
+                            'timestamp':timestamp
+                                }
+            logging.info('写入缓存label:{}'.format(label))
     
+    def not_expired(self,timestamp):
+        """判断缓存是否过期"""
+        return datetime.now() <= timestamp + self.expires
+
 class mongodbcache(Cache):
+    """MongoDB缓存"""
     pass
 
 class Downloader():
@@ -163,7 +178,8 @@ class Downloader():
             self.headers['User-Agent'] = random.choice(UserAgents)
         
     def __call__(self):
-        result = None
+        """先尝试查询缓存，确定没有缓存后尝试requests"""
+        response = None
         if self.cache:
             self.label = self.cache.label(
                             self.url,
@@ -171,30 +187,29 @@ class Downloader():
                             self.params,
                             self.data)
             try:
-                result = self.cache[self.label]
+                response = self.cache[self.label]
                 logging.info('读取缓存成功...')
             except KeyError:
                 logging.info('读取缓存失败...')
-            else:
-                if self.retry > 0 and result:
-                    result = None
-        if result is None:
+
+        if response is None:
             self.throttle.wait(self.url)
             if self.proxies:
                 self.proxies = self.proxies.new_proxy()
-            result = self.download()
+            response = self.download()
             if self.cache:
-                self.cache[self.label] = result
-        return result
+                self.cache[self.label] = response
+        return response
 
     def download(self):
+        """封装requests"""
         loader = self.session if self.session else requests
         if self.method == 'GET':
             request_way = loader.get
         elif self.method == 'POST':
             request_way =  loader.post
         try:
-            result = request_way(
+            response = request_way(
                         url=self.url,
                         headers=self.headers,
                         params=self.params,
@@ -202,11 +217,11 @@ class Downloader():
                         proxies=self.proxies,
                         timeout=self.timeout
                             )
-            result.raise_for_status()
-            return result
+            response.raise_for_status()
+            return response
         except RequestException as e:
             logging.info('Request异常:{}'.format(e))
-            result = None
+            response = None
             if self.retry > 0:
                 self.retry -= 1
                 return self.download()
@@ -236,5 +251,7 @@ if __name__ == '__main__':
     print(result.status_code)
     #print(result.json().keys())
     print(len(result.json().get('content')['positionResult']['result']))
+
+
 
 
