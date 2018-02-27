@@ -16,6 +16,19 @@ import shelve
 
 import requests
 from requests.exceptions import RequestException
+HEADERS = """Host: www.lagou.com
+Connection: keep-alive
+Pragma: no-cache
+Cache-Control: no-cache
+Accept: application/json, text/javascript, */*; q=0.01
+X-Anit-Forge-Code: 0
+X-Requested-With: XMLHttpRequest
+X-Anit-Forge-Token: None
+User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/64.0.3282.167 Chrome/64.0.3282.167 Safari/537.36
+Referer: https://www.lagou.com/jobs/list_python?city=%E5%85%A8%E5%9B%BD&cl=false&fromSearch=true&labelWords=&suginput=
+Accept-Encoding: gzip, deflate, br
+Accept-Language: zh-CN,zh;q=0.9,en;q=0.8
+"""
 
 UserAgents=[
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/64.0.3282.167 Chrome/64.0.3282.167 Safari/537.36',
@@ -41,6 +54,7 @@ logging.basicConfig(
                 level=logging.INFO
                             )
 
+
 class ProxyTool():
     """调用代理地址池"""
     def __init__(self,source,delay=300):
@@ -48,11 +62,13 @@ class ProxyTool():
         self.source = source
         try:
             self.proxies_pool = requests.get(source,timeout=3).json()
+            self.sort_proxies()
+            logging.info('IP Prxoies Pool 初始化完成...包含{}个备用代理'.format(len(self.proxies_pool)))
         except:
             logging.info('本地代理池服务器的API失败...')
         self.used_proxies = {}
         self.delay = delay
-        logging.info('IP Prxoies Pool 初始化完成...包含{}个备用代理'.format(len(self.proxies_pool)))
+        
     def sort_proxies(self):
         """按速度排序"""
         self.proxies_pool = sorted(self.proxies_pool,key=lambda x:x.get('speed'))
@@ -60,23 +76,31 @@ class ProxyTool():
         """选取新的代理地址，设置同一个代理地址被使用的最小间隔时间，代理池用尽自动从服务器更新"""
         if self.proxies_pool:
             proxy = self.proxies_pool.pop(0)
-            last_accessed = self.used_proxies.get(proxy.get('ip'))
-            if self.delay > 0 and last_accessed is not None:
-                sleep_secs = self.delay - (datetime.now() - last_accessed).seconds
-                if sleep_secs > 0:
-                    time.sleep(sleep_secs)
-            self.used_proxies[proxy.get('ip')] = datetime.now()
-            proxy_url = 'http://{}:{}'.format(proxy.get('ip'),str(proxy.get('port')))
-            return {'http':proxy_url,'https':proxy_url}
+            if proxy is None:
+                return None
+            else:
+                last_accessed = self.used_proxies.get(proxy.get('ip'))
+                if self.delay > 0 and last_accessed is not None:
+                    sleep_secs = self.delay - (datetime.now() - last_accessed).seconds
+                    if sleep_secs > 0:
+                        self.new_proxy()
+                else:
+                    self.used_proxies[proxy.get('ip')] = datetime.now()
+                    proxy_url = 'http://{}:{}'.format(proxy.get('ip'),str(proxy.get('port')))
+                    return {'http':proxy_url,'https':proxy_url}
         else :
             self.update_pool()
-            self.new_proxy()    
+            self.new_proxy()
+
     def update_pool(self):
         """更新代理池"""
         self.proxies_pool = requests.get(self.source).json()
         self.sort_proxies()
         self.used_proxies = {}
         logging.info('IP Prxoies Pool更新完成...包含{}个备用代理'.format(len(self.proxies_pool)))
+
+    def add_None(self):
+        self.proxies_pool.append(None)
 
 class Throttle():
     """下载延迟，设置访问同一域名的最小间隔"""
@@ -108,6 +132,7 @@ class Cache():
         
     def label(self,url,headers,params,data):
         """创建hash标签"""
+        #去除随机UA
         headers.pop('User-Agent')
         h = hashlib.blake2b(digest_size=25)
         for x in (url,headers,params,data):
@@ -145,6 +170,15 @@ class DiskCache(Cache):
         """判断缓存是否过期"""
         return datetime.now() <= timestamp + self.expires
 
+    def del_cache(self,label):
+        """删除label对应的缓存"""
+        with shelve.open(self.cache_file_path) as cache_db:            
+            try:
+                cache_db.pop(label)
+                logging.info('*成功删除缓存{}'.format(label))
+            except Exception as e:
+                logging.info('*删除缓存失败,{}'.format(e))
+
 class mongodbcache(Cache):
     """MongoDB缓存"""
     pass
@@ -167,13 +201,12 @@ class Downloader():
             self.get_headers(headers,UserAgents)
     def use_session(self):
         self.session = requests.session()
-    def get_headers(self,path_to_headers_file=None,UserAgents=None):
+    def get_headers(self,h=None,UserAgents=None):
         self.headers = {}
-        if path_to_headers_file:          
-            with open(path_to_headers_file) as f:
-                for line in f:
-                    l = [x.strip() for x in line.split(':',1)]
-                    self.headers[l[0]] = l[1]
+        if h:
+            for line in h.strip().split('\n'):
+                l = [x.strip() for x in line.split(':',1)]
+                self.headers[l[0]] = l[1]
         if UserAgents:
             self.headers['User-Agent'] = random.choice(UserAgents)
         
@@ -194,10 +227,8 @@ class Downloader():
 
         if response is None:
             self.throttle.wait(self.url)
-            if self.proxies:
-                self.proxies = self.proxies.new_proxy()
             response = self.download()
-            if self.cache:
+            if self.cache and response:
                 self.cache[self.label] = response
         return response
 
@@ -209,6 +240,7 @@ class Downloader():
         elif self.method == 'POST':
             request_way =  loader.post
         try:
+            #logging.info('当前代理地址:{}'.format(self.proxies))
             response = request_way(
                         url=self.url,
                         headers=self.headers,
@@ -223,6 +255,7 @@ class Downloader():
             logging.info('Request异常:{}'.format(e))
             response = None
             if self.retry > 0:
+                logging.info('尝试第{}次失败'.format(5-self.retry))
                 self.retry -= 1
                 return self.download()
 
@@ -241,16 +274,27 @@ if __name__ == '__main__':
         'pn':'1',
         'kd':'python'
         }
-    #proxies = ProxyTool(IPProxyTool_url)
+    pool = ProxyTool(IPProxyTool_url)
+    proxies = pool.new_proxy()
     cache = DiskCache()
-    d = Downloader(search_root_url,headers=path_to_headers_file,params=params,
-                data=data,proxies=None,timeout=3,delay_tag=-1,retry=3,cache=cache)
+    d = Downloader(search_root_url,headers=HEADERS,params=params,
+                data=data,proxies=proxies,timeout=3,delay_tag=-1,retry=3,cache=None)
     d.use_session()
     d.method = 'POST'
-    result = d()
-    print(result.status_code)
-    #print(result.json().keys())
-    print(len(result.json().get('content')['positionResult']['result']))
+    t = len(pool.proxies_pool)+1
+    while t > 0:
+        d = Downloader(search_root_url,headers=HEADERS,params=params,
+                data=data,proxies=proxies,timeout=3,delay_tag=-1,retry=3,cache=None)
+        result = d()
+        if result:
+            print(result.status_code)
+            #print(result.json().keys())
+            print(len(result.json().get('content')['positionResult']['result']))
+            break
+        else:
+            t -= 1
+            proxies = pool.new_proxy()
+
 
 
 
